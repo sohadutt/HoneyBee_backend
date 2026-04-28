@@ -1,0 +1,28 @@
+spring:
+  application:
+    name: honeybee-backend
+  autoconfigure:
+    exclude:
+      - org.springframework.ai.model.chat.memory.redis.autoconfigure.RedisChatMemoryAutoConfiguration
+      - org.springframework.ai.vectorstore.s3.autoconfigure.S3VectorStoreAutoConfiguration
+  datasource:
+    url: jdbc:h2:mem:honeybee;MODE=PostgreSQL;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+    properties:
+      hibernate:
+        format_sql: true
+  flyway:
+    enabled: false
+
+server:
+  port: 8080
