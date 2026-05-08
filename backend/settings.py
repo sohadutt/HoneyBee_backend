@@ -13,6 +13,12 @@ https://docs.djangoproject.com/en/6.0/ref/settings/
 import os
 from pathlib import Path
 
+import dj_database_url
+from dotenv import load_dotenv
+
+# Load environment variables from your .env file
+load_dotenv()
+
 try:
     import sentry_sdk
 except ImportError:
@@ -29,7 +35,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "django-insecure-wtd68_$d6#to778qn@z(e=ta^u&m=jdhdd+_-yct9hpi-l6reu")
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = os.environ.get("DJANGO_DEBUG", "true").lower() == "true"
+DEBUG = True
 
 ALLOWED_HOSTS = [host for host in os.environ.get("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1").split(",") if host]
 
@@ -85,15 +91,18 @@ WSGI_APPLICATION = 'backend.wsgi.application'
 # https://docs.djangoproject.com/en/6.0/ref/settings/#databases
 
 DATABASES = {
-    'default': {
-        'ENGINE': os.environ.get('DB_ENGINE', 'django.db.backends.sqlite3'),
-        'NAME': os.environ.get('DB_NAME', str(BASE_DIR / 'db.sqlite3')),
-        'USER': os.environ.get('DB_USER', ''),
-        'PASSWORD': os.environ.get('DB_PASSWORD', ''),
-        'HOST': os.environ.get('DB_HOST', ''),
-        'PORT': os.environ.get('DB_PORT', ''),
-    }
+    'default': dj_database_url.config(
+        default=os.environ.get('DATABASE_URL', f"sqlite:///{BASE_DIR / 'db.sqlite3'}"),
+        conn_max_age=600,
+        conn_health_checks=True,
+    )
 }
+
+if 'pgbouncer=true' in os.environ.get('DATABASE_URL', ''):
+    DATABASES['default']['OPTIONS'] = {
+        'sslmode': 'require',
+    }
+    DATABASES['default']['DISABLE_SERVER_SIDE_CURSORS'] = True
 
 
 # Password validation
