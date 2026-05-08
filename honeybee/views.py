@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
-import uuid
+import random
+import secrets
+import time
 from typing import cast
 
-import vercel_blob
+from celery.result import AsyncResult
 from django.conf import settings
+from django.core.cache import cache
 from django.core.files.uploadedfile import UploadedFile
 from django.db import transaction
 from django.db.models import QuerySet
@@ -18,33 +22,55 @@ from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
+from rest_framework.views import APIView
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
-from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
+from rest_framework_simplejwt.views import TokenRefreshView
 
-from .image_processing import ProcessedProfileImage, process_profile_image
 from .models import Conversation, Kink, Match, Message, MessagingWebhookEvent, User
 from .serializers import (
     ConversationSerializer,
+    EmailLoginSerializer,
+    GoogleLoginSerializer,
     KinkSerializer,
     MatchSerializer,
     MessagingWebhookEventSerializer,
+    OTPRequestSerializer,
+    OTPVerifySerializer,
     OutboundMessageSerializer,
     RecommendationSerializer,
     UserCreateSerializer,
     UserSerializer,
 )
 from .services import Recommendation, recommend_users
+from .tasks import ProfilePictureUpload, process_profile_pictures_task, send_otp_email_task
 
 MAX_PROFILE_PICTURES = 6
+OTP_TIMEOUT_SECONDS = 180
 
 
-class LoginView(TokenObtainPairView):
+class LoginView(APIView):
     permission_classes = [AllowAny]
+
+    def post(self, request: Request) -> Response:
+        serializer = EmailLoginSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        user = serializer.validated_data["user"]
+        return Response(_auth_payload(user, "Login successful."))
 
 
 class RefreshTokenView(TokenRefreshView):
     permission_classes = [AllowAny]
+
+
+class GoogleLoginView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request: Request) -> Response:
+        serializer = GoogleLoginSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
+        return Response(_auth_payload(user, "Google login successful."))
 
 
 @api_view(["POST"])
@@ -126,19 +152,35 @@ class UserViewSet(viewsets.ModelViewSet):
             )
 
         try:
-            processed_images = [_process_uploaded_picture(uploaded_file) for uploaded_file in uploaded_files]
+            task_uploads = [_picture_upload_payload(uploaded_file) for uploaded_file in uploaded_files]
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
-        uploaded_urls = [_save_profile_picture(user, image) for image in processed_images]
-        blurred_urls = [item["blurred"] for item in uploaded_urls]
-        highres_urls = [item["highres"] for item in uploaded_urls]
+        task = process_profile_pictures_task.delay(user.id, task_uploads, replaces_existing)
 
-        user.lowres_pictures_urls = blurred_urls if replaces_existing else [*user.lowres_pictures_urls, *blurred_urls]
-        user.highres_pictures_urls = highres_urls if replaces_existing else [*user.highres_pictures_urls, *highres_urls]
-        user.save(update_fields=["lowres_pictures_urls", "highres_pictures_urls", "updated_at"])
+        return Response(
+            {
+                "detail": "Profile picture processing started.",
+                "task_id": task.id,
+                "status_url": request.build_absolute_uri(f"status/{task.id}/"),
+            },
+            status=status.HTTP_202_ACCEPTED,
+        )
 
-        return Response(_profile_picture_payload(user), status=status.HTTP_201_CREATED)
+    @action(
+        detail=False,
+        methods=["get"],
+        permission_classes=[IsAuthenticated],
+        url_path=r"me/pictures/status/(?P<task_id>[^/.]+)",
+    )
+    def picture_status(self, request: Request, task_id: str) -> Response:
+        task = AsyncResult(task_id)
+        payload: dict[str, object] = {"task_id": task_id, "state": task.state}
+        if task.successful():
+            payload["result"] = task.result
+        elif task.failed():
+            payload["detail"] = str(task.result)
+        return Response(payload)
 
 
 class MatchViewSet(viewsets.ReadOnlyModelViewSet):
@@ -300,40 +342,15 @@ def _uploaded_picture_files(request: Request) -> list[UploadedFile]:
     return files
 
 
-def _process_uploaded_picture(uploaded_file: UploadedFile) -> ProcessedProfileImage:
+def _picture_upload_payload(uploaded_file: UploadedFile) -> ProfilePictureUpload:
     content_type = str(getattr(uploaded_file, "content_type", ""))
     if not content_type.startswith("image/"):
         raise ValueError("Only image uploads are supported.")
-    return process_profile_image(uploaded_file)
-
-
-def _save_profile_picture(user: User, image: ProcessedProfileImage) -> dict[str, str]:
-    picture_id = uuid.uuid4().hex
-    base_path = f"profile-pictures/{user.pk}/{picture_id}"
-    highres_url = _upload_blob(f"{base_path}-highres.{image.extension}", image.highres, image.content_type)
-    blurred_url = _upload_blob(f"{base_path}-blurred.{image.extension}", image.blurred, image.content_type)
-    return {"blurred": blurred_url, "highres": highres_url}
-
-
-def _upload_blob(pathname: str, body: bytes, content_type: str) -> str:
-    try:
-        response = vercel_blob.put(pathname, body, {"access": "public", "contentType": content_type})
-    except TypeError:
-        response = vercel_blob.put(pathname, body, access="public", content_type=content_type)
-    return _blob_response_url(response)
-
-
-def _blob_response_url(response: object) -> str:
-    if isinstance(response, dict):
-        url = response.get("url") or response.get("downloadUrl")
-        if isinstance(url, str):
-            return url
-
-    url = getattr(response, "url", None)
-    if isinstance(url, str):
-        return url
-
-    raise ValueError("Blob upload did not return a public URL.")
+    return {
+        "data": base64.b64encode(uploaded_file.read()).decode("ascii"),
+        "content_type": content_type,
+        "filename": uploaded_file.name,
+    }
 
 
 def _profile_picture_payload(user: User) -> dict[str, list[str]]:
@@ -386,11 +403,58 @@ def _profile_picture_index(
 
 @api_view(["POST"])
 @permission_classes([AllowAny])
+def request_otp(request: Request) -> Response:
+    serializer = OTPRequestSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    email = str(serializer.validated_data["email"]).strip().lower()
+    user = User.objects.filter(email=email).first()
+
+    if user is None:
+        time.sleep(random.uniform(0.1, 0.3))
+        return Response({"detail": "If an account exists, a verification code will be sent."})
+
+    _send_otp(email)
+    return Response({"detail": "If an account exists, a verification code will be sent."})
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def verify_otp(request: Request) -> Response:
+    serializer = OTPVerifySerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    email = str(serializer.validated_data["email"]).strip().lower()
+    otp = str(serializer.validated_data["otp"])
+
+    if cache.get(_otp_cache_key(email)) != otp:
+        return Response({"detail": "Invalid or expired verification code."}, status=status.HTTP_400_BAD_REQUEST)
+
+    user = User.objects.filter(email=email).first()
+    if user is None:
+        return Response({"detail": "Invalid or expired verification code."}, status=status.HTTP_400_BAD_REQUEST)
+
+    if not user.is_verified:
+        user.is_verified = True
+        user.save(update_fields=["is_verified", "updated_at"])
+
+    cache.delete(_otp_cache_key(email))
+    return Response(_auth_payload(user, "Verification successful."))
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
 def create_user(request: Request) -> Response:
     serializer = UserCreateSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
     user = serializer.save()
-    return Response(UserSerializer(user).data, status=status.HTTP_201_CREATED)
+    otp_sent = _send_otp(user.email)
+    detail = "User created. Verification code sent." if otp_sent else "User created. Verification email is unavailable."
+    return Response(
+        {
+            "detail": detail,
+            "user": UserSerializer(user).data,
+        },
+        status=status.HTTP_201_CREATED,
+    )
 
 
 @api_view(["GET"])
@@ -398,3 +462,27 @@ def create_user(request: Request) -> Response:
 def get_user_profile(request: Request) -> Response:
     user = cast(User, request.user)
     return Response(UserSerializer(user).data)
+
+
+def _send_otp(email: str) -> bool:
+    otp = "".join(secrets.choice("0123456789") for _ in range(6))
+    cache.set(_otp_cache_key(email), otp, timeout=OTP_TIMEOUT_SECONDS)
+    try:
+        send_otp_email_task.delay(email, otp)
+    except Exception:
+        cache.delete(_otp_cache_key(email))
+        return False
+    return True
+
+
+def _otp_cache_key(email: str) -> str:
+    return f"auth-otp:{email}"
+
+
+def _auth_payload(user: User, detail: str) -> dict[str, object]:
+    refresh = RefreshToken.for_user(user)
+    return {
+        "detail": detail,
+        "user": UserSerializer(user).data,
+        "tokens": {"refresh": str(refresh), "access": str(refresh.access_token)},
+    }

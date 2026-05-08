@@ -20,8 +20,12 @@ class ProcessedProfileImage:
 
 
 def process_profile_image(uploaded_file: UploadedFile) -> ProcessedProfileImage:
+    return process_profile_image_bytes(uploaded_file.read())
+
+
+def process_profile_image_bytes(image_data: bytes) -> ProcessedProfileImage:
     try:
-        image = Image.open(uploaded_file)
+        image = Image.open(BytesIO(image_data))
     except UnidentifiedImageError as exc:
         raise ValueError("Upload a valid image file.") from exc
 
