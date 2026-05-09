@@ -4,10 +4,10 @@ from typing import Any
 
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin
-from django.db.models import Count, QuerySet
 from django.http import HttpRequest
 
-from .models import Conversation, Kink, Match, Message, MessagingWebhookEvent, User
+# Removed 'Kink' from imports
+from .models import Conversation, Match, Message, MessagingWebhookEvent, User
 
 
 @admin.register(User)
@@ -28,6 +28,7 @@ class HoneybeeUserAdmin(UserAdmin):
                     "sex",
                     "orientation",
                     "dominance",
+                    "kinks",  # JSON array
                     "lowres_pictures_urls",
                     "highres_pictures_urls",
                     "messaging_external_id",
@@ -52,26 +53,17 @@ class HoneybeeUserAdmin(UserAdmin):
         ),
     )
     
-    filter_horizontal = ("groups", "user_permissions", "kinks")
+    # Removed "kinks" from filter_horizontal because it is a JSONField now
+    filter_horizontal = ("groups", "user_permissions")
     list_display = ("email", "username", "first_name", "country", "tier", "is_verified", "is_staff")
     list_filter = ("country", "tier", "is_verified", "sex", "orientation", "is_staff")
     search_fields = ("email", "username", "first_name", "last_name", "phone")
     readonly_fields = ("created_at", "updated_at")
 
 
-@admin.register(Kink)
-class KinkAdmin(admin.ModelAdmin):
-    list_display = ("name", "user_count")
-    search_fields = ("name",)
-    ordering = ("name",)
-
-    def get_queryset(self, request: HttpRequest) -> QuerySet[Kink]:
-        """Annotate the queryset with a user count to avoid N+1 queries."""
-        return super().get_queryset(request).annotate(user_count=Count("users"))
-
-    @admin.display(description="Active Users", ordering="user_count")
-    def user_count(self, obj: Any) -> int:
-        return obj.user_count
+# ==========================================
+# REMOVED KinkAdmin entirely as it's no longer a DB table
+# ==========================================
 
 
 @admin.register(Match)
@@ -79,7 +71,8 @@ class MatchAdmin(admin.ModelAdmin):
     list_display = ("owner", "matched_user", "score", "kinks_in_common_count", "matched_at")
     list_filter = ("matched_at", "score")
     search_fields = ("owner__email", "matched_user__email", "owner__username", "matched_user__username")
-    filter_horizontal = ("kinks_in_common",)
+    
+    # Removed filter_horizontal = ("kinks_in_common",) because it is a JSONField now
     
     # Performance optimizations
     list_select_related = ("owner", "matched_user")

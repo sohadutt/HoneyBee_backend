@@ -12,12 +12,13 @@ from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
 from rest_framework import serializers
 
-# Removed 'Kink' from imports as it is no longer a database model
+# Import the enums directly from obj.py
+from .obj import CountryCode, Orientation, Sex
+
 from .models import Conversation, Match, Message, MessagingWebhookEvent, User
 
 
 class UserSerializer(serializers.ModelSerializer):
-    # Kinks is now simply a JSON array of strings
     kinks = serializers.ListField(
         child=serializers.CharField(),
         required=False
@@ -52,14 +53,13 @@ class UserSerializer(serializers.ModelSerializer):
             "lowres_pictures_urls",
             "highres_pictures_urls",
             "dominance",
-            "kinks",  # The JSON array of kink keys
+            "kinks",
             "created_at",
             "updated_at",
         ]
         read_only_fields = ["id", "tier", "is_verified", "created_at", "updated_at"]
 
     def validate_email(self, value: str) -> str:
-        """Ensure emails are always saved consistently in lowercase."""
         return value.strip().lower()
 
 
@@ -70,10 +70,6 @@ class UserCreateSerializer(UserSerializer):
         fields = [*UserSerializer.Meta.fields, "password"]
 
     def validate_password(self, value: str) -> str:
-        """
-        Catch Django's ValidationError from password validators and 
-        re-raise as DRF's ValidationError for proper 400 HTTP responses.
-        """
         try:
             django_validate_password(value)
         except DjangoValidationError as exc:
@@ -83,12 +79,9 @@ class UserCreateSerializer(UserSerializer):
     @transaction.atomic
     def create(self, validated_data: dict[str, Any]) -> User:
         password = str(validated_data.pop("password"))
-        
-        # JSON fields (like kinks and dominance) are automatically handled via **validated_data
         user = User(**validated_data)
         user.set_password(password)
         user.save()
-            
         return user
 
 
@@ -135,11 +128,13 @@ class GoogleLoginSerializer(serializers.Serializer):
     token = serializers.CharField(required=False, trim_whitespace=False)
     username = serializers.CharField(required=False, allow_blank=True)
     phone = serializers.CharField(required=False, allow_blank=True)
-    country = serializers.ChoiceField(choices=User.CountryCode.choices, required=False)
+    
+    # FIX: Using the imported enums from obj.py
+    country = serializers.ChoiceField(choices=CountryCode.choices, required=False)
     first_name = serializers.CharField(required=False, allow_blank=True)
     last_name = serializers.CharField(required=False, allow_blank=True)
-    sex = serializers.ChoiceField(choices=User.Sex.choices, required=False)
-    orientation = serializers.ChoiceField(choices=User.Orientation.choices, required=False)
+    sex = serializers.ChoiceField(choices=Sex.choices, required=False)
+    orientation = serializers.ChoiceField(choices=Orientation.choices, required=False)
 
     def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
         token = str(attrs.get("credential") or attrs.get("token") or "")
@@ -185,7 +180,6 @@ class GoogleLoginSerializer(serializers.Serializer):
                 user.save(update_fields=["is_verified", "updated_at"])
             return user
 
-        # Require specific demographic fields if it's a new account
         missing_fields = [
             field for field in ["phone", "country", "sex", "orientation"]
             if not self.validated_data.get(field)
@@ -216,7 +210,6 @@ class GoogleLoginSerializer(serializers.Serializer):
 
 
 def _generate_username_from_email(email: str) -> str:
-    """Generates a unique username based on the user's email address."""
     base = re.sub(r"[^a-zA-Z0-9_.-]", "", email.split("@")[0])[:140].lower()
     if not base:
         base = "user"
@@ -224,7 +217,6 @@ def _generate_username_from_email(email: str) -> str:
     username = base
     suffix = 1
     
-    # Query optimization: fetch existing matching prefixes to avoid N+1 querying in the while loop
     existing_usernames = set(User.objects.filter(username__startswith=base).values_list("username", flat=True))
     
     while username in existing_usernames:
@@ -235,7 +227,6 @@ def _generate_username_from_email(email: str) -> str:
 
 
 class PublicUserSerializer(serializers.ModelSerializer):
-    # Output the kinks directly as a list of strings
     kinks = serializers.ListField(child=serializers.CharField(), read_only=True)
     age = serializers.IntegerField(read_only=True)
     blurred_pictures_urls = serializers.ListField(
