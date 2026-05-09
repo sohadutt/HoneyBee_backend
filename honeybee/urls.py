@@ -6,13 +6,11 @@ from rest_framework.routers import DefaultRouter
 from .views import (
     ConversationViewSet,
     GoogleLoginView,
-    KinkViewSet,
     LoginView,
     MatchViewSet,
     RefreshTokenView,
     UserViewSet,
-    create_user,
-    get_user_profile,
+    available_kinks,
     logout,
     messaging_webhook,
     recommendations,
@@ -20,22 +18,35 @@ from .views import (
     verify_otp,
 )
 
+# Initialize the default router for ViewSets
 router = DefaultRouter()
-router.register("users", UserViewSet, basename="user")
-router.register("kinks", KinkViewSet, basename="kink")
-router.register("matches", MatchViewSet, basename="match")
-router.register("conversations", ConversationViewSet, basename="conversation")
+
+# User Routes:
+# - POST /users/ (Registration)
+# - GET/PATCH /users/me/ (Profile)
+# - GET/POST/PUT/DELETE /users/me/pictures/
+router.register(r"users", UserViewSet, basename="user")
+router.register(r"matches", MatchViewSet, basename="match")
+router.register(r"conversations", ConversationViewSet, basename="conversation")
 
 urlpatterns = [
+    # API ViewSets
     path("", include(router.urls)),
+
+    # Authentication & Session Management
     path("auth/login/", LoginView.as_view(), name="auth-login"),
     path("auth/google/", GoogleLoginView.as_view(), name="auth-google"),
-    path("auth/otp/request/", request_otp, name="auth-otp-request"),
-    path("auth/otp/verify/", verify_otp, name="auth-otp-verify"),
     path("auth/refresh/", RefreshTokenView.as_view(), name="auth-refresh"),
     path("auth/logout/", logout, name="auth-logout"),
-    path("auth/register/", create_user, name="auth-register"),
-    path("profile/", get_user_profile, name="profile"),
+
+    # OTP Verification Flows
+    path("auth/otp/request/", request_otp, name="auth-otp-request"),
+    path("auth/otp/verify/", verify_otp, name="auth-otp-verify"),
+
+    # Application Features & Data
     path("recommendations/", recommendations, name="recommendations"),
+    path("kinks/available/", available_kinks, name="available-kinks"),
+
+    # Webhooks
     path("webhooks/messaging/", messaging_webhook, name="messaging-webhook"),
 ]

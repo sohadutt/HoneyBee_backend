@@ -4,22 +4,23 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import random
 import secrets
 import time
-from typing import cast
+from typing import Any, cast
 
 from celery.result import AsyncResult
 from django.conf import settings
 from django.core.cache import cache
 from django.core.files.uploadedfile import UploadedFile
 from django.db import transaction
-from django.db.models import QuerySet
+from django.db.models import Count, QuerySet
 from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.parsers import FormParser, MultiPartParser
-from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.permissions import AllowAny, BasePermission, IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -27,12 +28,13 @@ from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenRefreshView
 
-from .models import Conversation, Kink, Match, Message, MessagingWebhookEvent, User
+# Import the new PREDEFINED_KINKS dictionary
+from .obj import PREDEFINED_KINKS
+from .models import Conversation, Match, Message, MessagingWebhookEvent, User
 from .serializers import (
     ConversationSerializer,
     EmailLoginSerializer,
     GoogleLoginSerializer,
-    KinkSerializer,
     MatchSerializer,
     MessagingWebhookEventSerializer,
     OTPRequestSerializer,
@@ -45,8 +47,28 @@ from .serializers import (
 from .services import Recommendation, recommend_users
 from .tasks import ProfilePictureUpload, process_profile_pictures_task, send_otp_email_task
 
+logger = logging.getLogger(__name__)
+
 MAX_PROFILE_PICTURES = 6
 OTP_TIMEOUT_SECONDS = 180
+
+
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def available_kinks(request: Request) -> Response:
+    """
+    Returns the predefined dictionary of kinks.
+    Formatted as a list of objects for easy frontend rendering.
+    """
+    formatted_kinks = [
+        {
+            "id": key, 
+            "name": key.replace("_", " ").title(), 
+            "description": description
+        }
+        for key, description in PREDEFINED_KINKS.items()
+    ]
+    return Response(formatted_kinks)
 
 
 class LoginView(APIView):
@@ -84,6 +106,7 @@ def logout(request: Request) -> Response:
         token = RefreshToken(str(refresh_token))
         token.blacklist()
     except AttributeError:
+        # If the blacklist app is not installed
         return Response(status=status.HTTP_204_NO_CONTENT)
     except TokenError:
         return Response({"detail": "Invalid refresh token."}, status=status.HTTP_400_BAD_REQUEST)
@@ -91,14 +114,8 @@ def logout(request: Request) -> Response:
     return Response(status=status.HTTP_204_NO_CONTENT)
 
 
-class KinkViewSet(viewsets.ModelViewSet):
-    queryset = Kink.objects.all()
-    serializer_class = KinkSerializer
-    permission_classes = [IsAuthenticated]
-
-
 class UserViewSet(viewsets.ModelViewSet):
-    queryset = User.objects.prefetch_related("kinks")
+    queryset = User.objects.all()
     permission_classes = [IsAuthenticated]
 
     def get_serializer_class(self) -> type[UserSerializer] | type[UserCreateSerializer]:
@@ -106,10 +123,25 @@ class UserViewSet(viewsets.ModelViewSet):
             return UserCreateSerializer
         return UserSerializer
 
-    def get_permissions(self) -> list[object]:
+    def get_permissions(self) -> list[BasePermission]:
         if self.action == "create":
             return [AllowAny()]
         return super().get_permissions()
+
+    @transaction.atomic
+    def create(self, request: Request, *args: Any, **kwargs: Any) -> Response:
+        """Overridden to handle User creation and immediate OTP dispatch."""
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
+        
+        otp_sent = _send_otp(user.email)
+        detail = "User created. Verification code sent." if otp_sent else "User created. Verification email is unavailable."
+        
+        return Response(
+            {"detail": detail, "user": UserSerializer(user).data},
+            status=status.HTTP_201_CREATED,
+        )
 
     @action(detail=False, methods=["get", "patch"], permission_classes=[IsAuthenticated])
     def me(self, request: Request) -> Response:
@@ -145,6 +177,7 @@ class UserViewSet(viewsets.ModelViewSet):
 
         replaces_existing = request.method == "PUT"
         current_count = 0 if replaces_existing else len(user.highres_pictures_urls)
+        
         if current_count + len(uploaded_files) > MAX_PROFILE_PICTURES:
             return Response(
                 {"detail": f"Profiles can have at most {MAX_PROFILE_PICTURES} pictures."},
@@ -175,7 +208,7 @@ class UserViewSet(viewsets.ModelViewSet):
     )
     def picture_status(self, request: Request, task_id: str) -> Response:
         task = AsyncResult(task_id)
-        payload: dict[str, object] = {"task_id": task_id, "state": task.state}
+        payload: dict[str, Any] = {"task_id": task_id, "state": task.state}
         if task.successful():
             payload["result"] = task.result
         elif task.failed():
@@ -191,7 +224,6 @@ class MatchViewSet(viewsets.ReadOnlyModelViewSet):
         return (
             Match.objects.filter(owner=self.request.user)
             .select_related("matched_user")
-            .prefetch_related("matched_user__kinks", "kinks_in_common")
         )
 
 
@@ -202,7 +234,7 @@ class ConversationViewSet(viewsets.ReadOnlyModelViewSet):
     def get_queryset(self) -> QuerySet[Conversation]:
         return (
             Conversation.objects.filter(participants=self.request.user)
-            .prefetch_related("participants__kinks", "messages")
+            .prefetch_related("participants", "messages")
             .distinct()
         )
 
@@ -213,6 +245,7 @@ class ConversationViewSet(viewsets.ReadOnlyModelViewSet):
         serializer.is_valid(raise_exception=True)
         sender = cast(User, request.user)
         recipient = cast(User, serializer.validated_data["recipient"])
+        
         conversation = _get_or_create_conversation(sender, recipient)
         message = Message.objects.create(
             conversation=conversation,
@@ -222,7 +255,11 @@ class ConversationViewSet(viewsets.ReadOnlyModelViewSet):
             body=serializer.validated_data["body"],
         )
         conversation.save(update_fields=["updated_at"])
-        return Response(ConversationSerializer(conversation).data | {"message_id": message.id}, status=status.HTTP_201_CREATED)
+        
+        return Response(
+            ConversationSerializer(conversation).data | {"message_id": message.id}, 
+            status=status.HTTP_201_CREATED
+        )
 
 
 @api_view(["GET"])
@@ -242,9 +279,10 @@ def recommendations(request: Request) -> Response:
 @permission_classes([AllowAny])
 def messaging_webhook(request: Request) -> Response:
     if not _valid_webhook_signature(request):
+        logger.warning("Rejected webhook event due to invalid signature.")
         return Response({"detail": "Invalid webhook signature."}, status=status.HTTP_401_UNAUTHORIZED)
 
-    payload = cast(dict[str, object], request.data)
+    payload = cast(dict[str, Any], request.data)
     event_id = str(payload.get("event_id") or payload.get("id") or "")
     event_type = str(payload.get("event_type") or payload.get("type") or "message.received")
     provider = str(payload.get("provider") or "generic")
@@ -264,8 +302,23 @@ def messaging_webhook(request: Request) -> Response:
     return Response(MessagingWebhookEventSerializer(event).data, status=status.HTTP_202_ACCEPTED)
 
 
+# ==========================================
+# UTILITY FUNCTIONS
+# ==========================================
+
 def _get_or_create_conversation(user: User, recipient: User) -> Conversation:
-    conversation = Conversation.objects.filter(participants=user).filter(participants=recipient).first()
+    """
+    Ensures a 1-on-1 conversation exists. Uses annotation to strictly find 
+    conversations with exactly 2 participants to avoid fetching group chats.
+    """
+    conversation = (
+        Conversation.objects.annotate(p_count=Count("participants"))
+        .filter(participants=user)
+        .filter(participants=recipient)
+        .filter(p_count=2)
+        .first()
+    )
+    
     if conversation is not None:
         return conversation
 
@@ -276,12 +329,15 @@ def _get_or_create_conversation(user: User, recipient: User) -> Conversation:
 
 def _save_recommendations_as_matches(user: User, items: list[Recommendation]) -> None:
     for item in items:
-        match, _created = Match.objects.update_or_create(
+        Match.objects.update_or_create(
             owner=user,
             matched_user=item.user,
-            defaults={"score": item.score, "kinks_in_common_count": len(item.shared_kinks)},
+            defaults={
+                "score": item.score, 
+                "kinks_in_common_count": len(item.shared_kinks),
+                "kinks_in_common": item.shared_kinks,  # Directly assign the list now
+            },
         )
-        match.kinks_in_common.set(Kink.objects.filter(name__in=item.shared_kinks))
 
 
 def _valid_webhook_signature(request: Request) -> bool:
@@ -290,13 +346,17 @@ def _valid_webhook_signature(request: Request) -> bool:
         return True
 
     signature = request.headers.get("X-Honeybee-Signature", "")
-    digest = hmac.new(secret.encode(), request.body, hashlib.sha256).hexdigest()
+    
+    # Ensure request.body is read securely (DRF sometimes clears the stream depending on the parser)
+    body = request.body if hasattr(request, "body") else b""
+    digest = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
     expected = f"sha256={digest}"
+    
     return hmac.compare_digest(signature, expected)
 
 
 def _process_message_event(event: MessagingWebhookEvent) -> None:
-    payload = cast(dict[str, object], event.payload)
+    payload = cast(dict[str, Any], event.payload)
     if event.event_type not in {"message.received", "message.created", "message.inbound"}:
         event.processed_at = timezone.now()
         event.save(update_fields=["processed_at"])
@@ -305,6 +365,7 @@ def _process_message_event(event: MessagingWebhookEvent) -> None:
     sender_external_id = str(payload.get("sender_external_id") or payload.get("from") or "")
     recipient_external_id = str(payload.get("recipient_external_id") or payload.get("to") or "")
     body = str(payload.get("body") or payload.get("text") or "")
+    
     if not sender_external_id or not recipient_external_id or not body:
         event.processed_at = timezone.now()
         event.save(update_fields=["processed_at"])
@@ -312,7 +373,9 @@ def _process_message_event(event: MessagingWebhookEvent) -> None:
 
     sender = User.objects.filter(messaging_external_id=sender_external_id).first()
     recipient = User.objects.filter(messaging_external_id=recipient_external_id).first()
+    
     if recipient is None:
+        logger.warning(f"Webhook Message Error: Recipient {recipient_external_id} not found.")
         event.processed_at = timezone.now()
         event.save(update_fields=["processed_at"])
         return
@@ -329,6 +392,7 @@ def _process_message_event(event: MessagingWebhookEvent) -> None:
         body=body,
         provider_message_id=str(payload.get("message_id") or payload.get("provider_message_id") or event.event_id),
     )
+    
     conversation.save(update_fields=["updated_at"])
     event.processed_at = timezone.now()
     event.save(update_fields=["processed_at"])
@@ -381,7 +445,7 @@ def _delete_profile_picture(user: User, request: Request) -> Response:
 
 def _profile_picture_index(
     user: User,
-    raw_index: object,
+    raw_index: Any,
     highres_url: str,
     blurred_url: str,
 ) -> int | None:
@@ -440,36 +504,13 @@ def verify_otp(request: Request) -> Response:
     return Response(_auth_payload(user, "Verification successful."))
 
 
-@api_view(["POST"])
-@permission_classes([AllowAny])
-def create_user(request: Request) -> Response:
-    serializer = UserCreateSerializer(data=request.data)
-    serializer.is_valid(raise_exception=True)
-    user = serializer.save()
-    otp_sent = _send_otp(user.email)
-    detail = "User created. Verification code sent." if otp_sent else "User created. Verification email is unavailable."
-    return Response(
-        {
-            "detail": detail,
-            "user": UserSerializer(user).data,
-        },
-        status=status.HTTP_201_CREATED,
-    )
-
-
-@api_view(["GET"])
-@permission_classes([IsAuthenticated])
-def get_user_profile(request: Request) -> Response:
-    user = cast(User, request.user)
-    return Response(UserSerializer(user).data)
-
-
 def _send_otp(email: str) -> bool:
     otp = "".join(secrets.choice("0123456789") for _ in range(6))
     cache.set(_otp_cache_key(email), otp, timeout=OTP_TIMEOUT_SECONDS)
     try:
         send_otp_email_task.delay(email, otp)
-    except Exception:
+    except Exception as e:
+        logger.error(f"Failed to queue OTP email for {email}: {e}")
         cache.delete(_otp_cache_key(email))
         return False
     return True
@@ -479,7 +520,7 @@ def _otp_cache_key(email: str) -> str:
     return f"auth-otp:{email}"
 
 
-def _auth_payload(user: User, detail: str) -> dict[str, object]:
+def _auth_payload(user: User, detail: str) -> dict[str, Any]:
     refresh = RefreshToken.for_user(user)
     return {
         "detail": detail,

@@ -1,33 +1,26 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 
 from django.conf import settings
 from django.contrib.auth import authenticate
-from django.contrib.auth.password_validation import validate_password
+from django.contrib.auth.password_validation import validate_password as django_validate_password
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
 from rest_framework import serializers
 
-from .models import Conversation, Kink, Match, Message, MessagingWebhookEvent, User
-from .services import Recommendation
-
-
-class KinkSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Kink
-        fields = ["id", "name", "description"]
+# Removed 'Kink' from imports as it is no longer a database model
+from .models import Conversation, Match, Message, MessagingWebhookEvent, User
 
 
 class UserSerializer(serializers.ModelSerializer):
-    kinks = KinkSerializer(many=True, read_only=True)
-    kink_ids = serializers.PrimaryKeyRelatedField(
-        queryset=Kink.objects.all(),
-        many=True,
-        write_only=True,
-        required=False,
-        source="kinks",
+    # Kinks is now simply a JSON array of strings
+    kinks = serializers.ListField(
+        child=serializers.CharField(),
+        required=False
     )
     age = serializers.IntegerField(read_only=True)
     blurred_pictures_urls = serializers.ListField(
@@ -59,28 +52,43 @@ class UserSerializer(serializers.ModelSerializer):
             "lowres_pictures_urls",
             "highres_pictures_urls",
             "dominance",
-            "kinks",
-            "kink_ids",
+            "kinks",  # The JSON array of kink keys
             "created_at",
             "updated_at",
         ]
         read_only_fields = ["id", "tier", "is_verified", "created_at", "updated_at"]
 
+    def validate_email(self, value: str) -> str:
+        """Ensure emails are always saved consistently in lowercase."""
+        return value.strip().lower()
+
 
 class UserCreateSerializer(UserSerializer):
-    password = serializers.CharField(write_only=True, min_length=8, validators=[validate_password])
+    password = serializers.CharField(write_only=True, min_length=8)
 
     class Meta(UserSerializer.Meta):
         fields = [*UserSerializer.Meta.fields, "password"]
 
+    def validate_password(self, value: str) -> str:
+        """
+        Catch Django's ValidationError from password validators and 
+        re-raise as DRF's ValidationError for proper 400 HTTP responses.
+        """
+        try:
+            django_validate_password(value)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(list(exc.messages))
+        return value
+
     @transaction.atomic
-    def create(self, validated_data: dict[str, object]) -> User:
-        kinks = validated_data.pop("kinks", [])
+    def create(self, validated_data: dict[str, Any]) -> User:
         password = str(validated_data.pop("password"))
+        
+        # JSON fields (like kinks and dominance) are automatically handled via **validated_data
         user = User(**validated_data)
         user.set_password(password)
         user.save()
-        user.kinks.set(kinks)
+            
         return user
 
 
@@ -88,30 +96,38 @@ class EmailLoginSerializer(serializers.Serializer):
     email = serializers.EmailField()
     password = serializers.CharField(write_only=True, trim_whitespace=False)
 
-    def validate(self, attrs: dict[str, object]) -> dict[str, User]:
+    def validate(self, attrs: dict[str, Any]) -> dict[str, User]:
         email = str(attrs["email"]).strip().lower()
         password = str(attrs["password"])
+        
         user = authenticate(
             request=self.context.get("request"),
             username=email,
             password=password,
         )
-        if user is None:
+        
+        if user is None or not isinstance(user, User):
             raise serializers.ValidationError("Unable to log in with provided credentials.")
-        if not isinstance(user, User):
-            raise serializers.ValidationError("Unable to log in with provided credentials.")
+            
         if not user.is_verified:
             raise serializers.ValidationError("Verify your account before logging in.")
+            
         return {"user": user}
 
 
 class OTPRequestSerializer(serializers.Serializer):
     email = serializers.EmailField()
+    
+    def validate_email(self, value: str) -> str:
+        return value.strip().lower()
 
 
 class OTPVerifySerializer(serializers.Serializer):
     email = serializers.EmailField()
     otp = serializers.RegexField(regex=r"^\d{6}$")
+
+    def validate_email(self, value: str) -> str:
+        return value.strip().lower()
 
 
 class GoogleLoginSerializer(serializers.Serializer):
@@ -125,12 +141,12 @@ class GoogleLoginSerializer(serializers.Serializer):
     sex = serializers.ChoiceField(choices=User.Sex.choices, required=False)
     orientation = serializers.ChoiceField(choices=User.Orientation.choices, required=False)
 
-    def validate(self, attrs: dict[str, object]) -> dict[str, object]:
+    def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
         token = str(attrs.get("credential") or attrs.get("token") or "")
         if not token:
             raise serializers.ValidationError("Google credential is required.")
 
-        client_id = settings.GOOGLE_OAUTH_CLIENT_ID
+        client_id = getattr(settings, "GOOGLE_OAUTH_CLIENT_ID", None)
         if not client_id:
             raise serializers.ValidationError("Google login is not configured.")
 
@@ -155,11 +171,12 @@ class GoogleLoginSerializer(serializers.Serializer):
         return attrs
 
     @transaction.atomic
-    def save(self, **kwargs: object) -> User:
+    def save(self, **kwargs: Any) -> User:
         email = str(self.validated_data["email"])
         payload = self.validated_data["google_payload"]
+        
         if not isinstance(payload, dict):
-            raise serializers.ValidationError("Invalid Google credential.")
+            raise serializers.ValidationError("Invalid Google credential payload.")
 
         user = User.objects.filter(email=email).first()
         if user is not None:
@@ -168,9 +185,9 @@ class GoogleLoginSerializer(serializers.Serializer):
                 user.save(update_fields=["is_verified", "updated_at"])
             return user
 
+        # Require specific demographic fields if it's a new account
         missing_fields = [
-            field
-            for field in ["phone", "country", "sex", "orientation"]
+            field for field in ["phone", "country", "sex", "orientation"]
             if not self.validated_data.get(field)
         ]
         if missing_fields:
@@ -181,6 +198,7 @@ class GoogleLoginSerializer(serializers.Serializer):
         username = str(self.validated_data.get("username") or "").strip() or _generate_username_from_email(email)
         first_name = str(self.validated_data.get("first_name") or payload.get("given_name") or "")
         last_name = str(self.validated_data.get("last_name") or payload.get("family_name") or "")
+        
         user = User(
             username=username,
             email=email,
@@ -198,17 +216,27 @@ class GoogleLoginSerializer(serializers.Serializer):
 
 
 def _generate_username_from_email(email: str) -> str:
-    base = re.sub(r"[^a-zA-Z0-9@.+_-]", "", email.split("@")[0])[:140].lower() or "user"
-    username = base[:150]
+    """Generates a unique username based on the user's email address."""
+    base = re.sub(r"[^a-zA-Z0-9_.-]", "", email.split("@")[0])[:140].lower()
+    if not base:
+        base = "user"
+        
+    username = base
     suffix = 1
-    while User.objects.filter(username=username).exists():
+    
+    # Query optimization: fetch existing matching prefixes to avoid N+1 querying in the while loop
+    existing_usernames = set(User.objects.filter(username__startswith=base).values_list("username", flat=True))
+    
+    while username in existing_usernames:
         username = f"{base[: 150 - len(str(suffix))]}{suffix}"
         suffix += 1
+        
     return username
 
 
 class PublicUserSerializer(serializers.ModelSerializer):
-    kinks = KinkSerializer(many=True, read_only=True)
+    # Output the kinks directly as a list of strings
+    kinks = serializers.ListField(child=serializers.CharField(), read_only=True)
     age = serializers.IntegerField(read_only=True)
     blurred_pictures_urls = serializers.ListField(
         child=serializers.URLField(),
